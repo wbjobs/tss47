@@ -631,6 +631,131 @@ body {
 .flags-rst { color: var(--danger); }
 .flags-psh { color: var(--success); }
 
+/* ===== 过滤面板 ===== */
+.filter-panel {
+  padding: 14px 20px 18px;
+  animation: fadeIn 0.3s ease;
+}
+
+.filter-panel.collapsed .filter-rows {
+  display: none;
+}
+
+.filter-rows {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin-top: 10px;
+}
+
+.filter-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 8px 12px;
+  background: var(--bg-2);
+  border-radius: 8px;
+  border: 1px solid var(--border);
+}
+
+.filter-row select,
+.filter-row input {
+  padding: 7px 10px;
+  background: var(--bg);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  font-size: 13px;
+}
+
+.filter-row .f-field { min-width: 150px; }
+.filter-row .f-op { min-width: 180px; }
+.filter-row .f-value {
+  flex: 1;
+  font-family: "Fira Code", Consolas, monospace;
+}
+
+.mini-btn {
+  padding: 6px 12px;
+  background: var(--card-hover);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  cursor: pointer;
+  font-size: 12px;
+  font-weight: 600;
+  margin-left: 4px;
+  transition: all 0.15s;
+}
+.mini-btn:hover { background: #475569; }
+.mini-btn-primary { background: linear-gradient(135deg,#3b82f6,#6366f1); border-color: transparent; color: white; }
+.mini-btn-primary:hover { filter: brightness(1.1); }
+.mini-btn-success { background: linear-gradient(135deg,#059669,#10b981); border-color: transparent; color: white; }
+.mini-btn-success:hover { filter: brightness(1.1); }
+.mini-btn-warn { background: linear-gradient(135deg,#b45309,#f59e0b); border-color: transparent; color: white; }
+.mini-btn-warn:hover { filter: brightness(1.1); }
+.mini-btn-danger { background: #7f1d1d; border-color: transparent; color: #fca5a5; padding: 7px 10px; }
+.mini-btn-danger:hover { background: #991b1b; }
+
+/* ===== 河流图异常红点 ===== */
+.anomaly-dot {
+  cursor: pointer;
+  transition: all 0.2s;
+}
+.anomaly-dot:hover {
+  stroke-width: 3 !important;
+  filter: drop-shadow(0 0 8px rgba(239,68,68,0.9));
+}
+.anomaly-dot.pulse {
+  animation: anomalyPulse 1.6s ease-in-out infinite;
+}
+@keyframes anomalyPulse {
+  0%, 100% { r: 5; opacity: 0.85; }
+  50%      { r: 9; opacity: 1; }
+}
+
+/* ===== 异常 IP 摘要卡片 ===== */
+.anom-stats {
+  background: var(--bg-2);
+  padding: 8px 12px;
+  border-radius: 6px;
+}
+.anom-stats .as-label {
+  font-size: 11px;
+  color: var(--text-muted);
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  margin-bottom: 4px;
+}
+.anom-stats .as-value {
+  font-size: 17px;
+  font-weight: 700;
+  color: var(--text);
+  font-family: "Fira Code", Consolas, monospace;
+}
+.anom-stats .as-sub {
+  font-size: 12px;
+  color: var(--warning);
+  margin-top: 2px;
+}
+.anom-stats.danger .as-value { color: #fca5a5; }
+.anom-stats.warn .as-value { color: #fbbf24; }
+.anom-stats.success .as-value { color: #34d399; }
+.anom-stats.info .as-value { color: #60a5fa; }
+
+.badge {
+  display: inline-block;
+  padding: 2px 8px;
+  border-radius: 999px;
+  font-size: 11px;
+  font-weight: 600;
+}
+.badge-danger { background: rgba(239,68,68,0.15); color: #fca5a5; }
+.badge-active { background: rgba(59,130,246,0.2); color: #93c5fd; }
+
+.dir-up { color: #f59e0b; font-weight: 700; }
+.dir-down { color: #3b82f6; font-weight: 700; }
+
 @media (max-width: 1100px) {
   .stats-bar { grid-template-columns: repeat(2, 1fr); }
   .two-columns { grid-template-columns: 1fr; }
@@ -641,4 +766,7 @@ body {
   .app-header { flex-direction: column; gap: 14px; align-items: flex-start; }
   .stats-bar { grid-template-columns: 1fr; }
   .control-panel { flex-direction: column; align-items: stretch; }
+  .filter-row { flex-wrap: wrap; }
+  .filter-row .f-field,
+  .filter-row .f-op { min-width: auto; flex: 1; }
 }

@@ -20,6 +20,12 @@ from task_queue import (
     RQ_AVAILABLE,
     get_queue,
 )
+from filters import (
+    PACKET_ALLOWED_FIELDS,
+    SESSION_ALLOWED_FIELDS,
+    parse_filters,
+    parse_filters_from_query,
+)
 
 UPLOAD_DIR = os.path.join(os.path.dirname(__file__), "uploads")
 os.makedirs(UPLOAD_DIR, exist_ok=True)
@@ -337,12 +343,21 @@ def get_upload(upload_id: int, db: sqlite3.Connection = Depends(get_db)):
 
 
 @app.get("/api/time-range")
-def get_time_range(upload_id: int, db: sqlite3.Connection = Depends(get_db)):
+def get_time_range(
+    upload_id: int,
+    filters: Optional[str] = Query(None, description="JSON 字符串数组，格式见 /filters 文档"),
+    db: sqlite3.Connection = Depends(get_db),
+):
+    filter_arr = parse_filters_from_query(filters)
+    extra_sql, extra_params = parse_filters(filter_arr, PACKET_ALLOWED_FIELDS)
     c = db.cursor()
-    c.execute("""
-        SELECT MIN(timestamp) as min_ts, MAX(timestamp) as max_ts, COUNT(*) as cnt
-        FROM packets WHERE upload_id=?
-    """, (upload_id,))
+    params: List[Any] = [upload_id] + extra_params
+    where = f"p.upload_id = ?{extra_sql}"
+    sql = f"""
+        SELECT MIN(p.timestamp) as min_ts, MAX(p.timestamp) as max_ts, COUNT(*) as cnt
+        FROM packets p WHERE {where}
+    """
+    c.execute(sql, params)
     r = c.fetchone()
     if not r or r["cnt"] == 0:
         return {"min_timestamp": 0, "max_timestamp": 0, "count": 0}
@@ -359,19 +374,25 @@ def traffic_by_time_window(
     start_ts: Optional[float] = None,
     end_ts: Optional[float] = None,
     window_sec: float = Query(1.0, ge=0.01),
+    filters: Optional[str] = Query(None, description="JSON 字符串数组"),
     db: sqlite3.Connection = Depends(get_db),
 ):
+    filter_arr = parse_filters_from_query(filters)
+    extra_sql, extra_params = parse_filters(filter_arr, PACKET_ALLOWED_FIELDS)
+
     c = db.cursor()
     params: List[Any] = [upload_id]
-    where = "upload_id = ?"
+    where = "p.upload_id = ?"
     if start_ts is not None:
-        where += " AND timestamp >= ?"
+        where += " AND p.timestamp >= ?"
         params.append(start_ts)
     if end_ts is not None:
-        where += " AND timestamp <= ?"
+        where += " AND p.timestamp <= ?"
         params.append(end_ts)
+    params += extra_params
+    where += extra_sql
 
-    c.execute(f"SELECT MIN(timestamp) as m FROM packets WHERE {where}", params)
+    c.execute(f"SELECT MIN(p.timestamp) as m FROM packets p WHERE {where}", params)
     r = c.fetchone()
     if not r or r["m"] is None:
         return {"buckets": [], "window_sec": window_sec}
@@ -380,14 +401,14 @@ def traffic_by_time_window(
 
     sql = f"""
         SELECT
-            CAST((timestamp - ?) / ? AS INTEGER) as bucket_idx,
-            protocol,
+            CAST((p.timestamp - ?) / ? AS INTEGER) as bucket_idx,
+            p.protocol,
             COUNT(*) as packet_count,
-            SUM(length) as total_bytes
-        FROM packets
+            SUM(p.length) as total_bytes
+        FROM packets p
         WHERE {where}
-        GROUP BY bucket_idx, protocol
-        ORDER BY bucket_idx, protocol
+        GROUP BY bucket_idx, p.protocol
+        ORDER BY bucket_idx, p.protocol
     """
     all_params = [base, window_sec] + params
     c.execute(sql, all_params)
@@ -417,26 +438,32 @@ def protocol_distribution(
     upload_id: int,
     start_ts: Optional[float] = None,
     end_ts: Optional[float] = None,
+    filters: Optional[str] = Query(None, description="JSON 字符串数组"),
     db: sqlite3.Connection = Depends(get_db),
 ):
+    filter_arr = parse_filters_from_query(filters)
+    extra_sql, extra_params = parse_filters(filter_arr, PACKET_ALLOWED_FIELDS)
+
     c = db.cursor()
     params: List[Any] = [upload_id]
-    where = "upload_id = ?"
+    where = "p.upload_id = ?"
     if start_ts is not None:
-        where += " AND timestamp >= ?"
+        where += " AND p.timestamp >= ?"
         params.append(start_ts)
     if end_ts is not None:
-        where += " AND timestamp <= ?"
+        where += " AND p.timestamp <= ?"
         params.append(end_ts)
+    params += extra_params
+    where += extra_sql
 
     c.execute(f"""
         SELECT
-            COALESCE(protocol, 'OTHER') as protocol,
+            COALESCE(p.protocol, 'OTHER') as protocol,
             COUNT(*) as packet_count,
-            SUM(length) as total_bytes
-        FROM packets
+            SUM(p.length) as total_bytes
+        FROM packets p
         WHERE {where}
-        GROUP BY protocol
+        GROUP BY p.protocol
         ORDER BY packet_count DESC
     """, params)
     rows = c.fetchall()
@@ -460,35 +487,42 @@ def ip_pairs_ranking(
     start_ts: Optional[float] = None,
     end_ts: Optional[float] = None,
     top_n: int = Query(20, ge=1, le=200),
+    filters: Optional[str] = Query(None, description="JSON 字符串数组"),
     db: sqlite3.Connection = Depends(get_db),
 ):
+    filter_arr = parse_filters_from_query(filters)
+    extra_sql, extra_params = parse_filters(filter_arr, PACKET_ALLOWED_FIELDS)
+
     c = db.cursor()
     params: List[Any] = [upload_id]
-    where = "upload_id = ?"
+    where = "p.upload_id = ?"
     if start_ts is not None:
-        where += " AND timestamp >= ?"
+        where += " AND p.timestamp >= ?"
         params.append(start_ts)
     if end_ts is not None:
-        where += " AND timestamp <= ?"
+        where += " AND p.timestamp <= ?"
         params.append(end_ts)
+    params += extra_params
+    where += extra_sql
 
     c.execute(f"""
         SELECT
-            src_ip,
-            dst_ip,
-            protocol,
+            p.src_ip,
+            p.dst_ip,
+            p.protocol,
             COUNT(*) as packet_count,
-            SUM(length) as total_bytes
-        FROM packets
+            SUM(p.length) as total_bytes
+        FROM packets p
         WHERE {where}
-          AND src_ip IS NOT NULL
-          AND dst_ip IS NOT NULL
-        GROUP BY src_ip, dst_ip, protocol
+          AND p.src_ip IS NOT NULL
+          AND p.dst_ip IS NOT NULL
+        GROUP BY p.src_ip, p.dst_ip, p.protocol
         ORDER BY total_bytes DESC
         LIMIT ?
     """, params + [top_n])
     rows = c.fetchall()
     return {"ranking": [dict(r) for r in rows]}
+
 
 
 class SessionInfo(BaseModel):
@@ -512,26 +546,32 @@ def list_sessions(
     protocol: Optional[str] = None,
     limit: int = Query(100, ge=1, le=1000),
     offset: int = Query(0, ge=0),
+    filters: Optional[str] = Query(None, description="JSON 字符串数组"),
     db: sqlite3.Connection = Depends(get_db),
 ):
+    filter_arr = parse_filters_from_query(filters)
+    extra_sql, extra_params = parse_filters(filter_arr, SESSION_ALLOWED_FIELDS)
+
     c = db.cursor()
     params: List[Any] = [upload_id]
-    where = "upload_id = ?"
+    where = "s.upload_id = ?"
     if start_ts is not None:
-        where += " AND end_time >= ?"
+        where += " AND s.end_time >= ?"
         params.append(start_ts)
     if end_ts is not None:
-        where += " AND start_time <= ?"
+        where += " AND s.start_time <= ?"
         params.append(end_ts)
     if protocol:
-        where += " AND protocol = ?"
+        where += " AND s.protocol = ?"
         params.append(protocol)
+    params += extra_params
+    where += extra_sql
 
     c.execute(f"""
         SELECT s.*
         FROM sessions s
         WHERE {where}
-        ORDER BY total_bytes DESC
+        ORDER BY s.total_bytes DESC
         LIMIT ? OFFSET ?
     """, params + [limit, offset])
     rows = c.fetchall()
@@ -551,20 +591,26 @@ def session_packets(
     upload_id: Optional[int] = None,
     limit: int = Query(500, ge=1, le=5000),
     offset: int = Query(0, ge=0),
+    filters: Optional[str] = Query(None, description="JSON 字符串数组"),
     db: sqlite3.Connection = Depends(get_db),
 ):
+    filter_arr = parse_filters_from_query(filters)
+    extra_sql, extra_params = parse_filters(filter_arr, PACKET_ALLOWED_FIELDS)
+
     c = db.cursor()
     params: List[Any] = [session_id]
-    where = "session_id = ?"
+    where = "p.session_id = ?"
     if upload_id is not None:
-        where += " AND upload_id = ?"
+        where += " AND p.upload_id = ?"
         params.append(upload_id)
+    params += extra_params
+    where += extra_sql
 
     c.execute(f"""
         SELECT p.*
         FROM packets p
         WHERE {where}
-        ORDER BY timestamp ASC
+        ORDER BY p.timestamp ASC
         LIMIT ? OFFSET ?
     """, params + [limit, offset])
     rows = c.fetchall()
@@ -578,22 +624,28 @@ def sessions_at_time(
     tolerance_sec: float = Query(1.0, ge=0.01),
     protocol: Optional[str] = None,
     top_n: int = Query(50, ge=1, le=500),
+    filters: Optional[str] = Query(None, description="JSON 字符串数组"),
     db: sqlite3.Connection = Depends(get_db),
 ):
+    filter_arr = parse_filters_from_query(filters)
+    extra_sql, extra_params = parse_filters(filter_arr, SESSION_ALLOWED_FIELDS)
+
     start = timestamp - tolerance_sec
     end = timestamp + tolerance_sec
     c = db.cursor()
     params: List[Any] = [upload_id, start, end]
-    where = "upload_id = ? AND start_time <= ? AND end_time >= ?"
+    where = "s.upload_id = ? AND s.start_time <= ? AND s.end_time >= ?"
     if protocol:
-        where += " AND protocol = ?"
+        where += " AND s.protocol = ?"
         params.append(protocol)
+    params += extra_params
+    where += extra_sql
 
     c.execute(f"""
         SELECT s.*
         FROM sessions s
         WHERE {where}
-        ORDER BY total_bytes DESC
+        ORDER BY s.total_bytes DESC
         LIMIT ?
     """, params + [top_n])
     rows = c.fetchall()
@@ -602,6 +654,303 @@ def sessions_at_time(
         "tolerance_sec": tolerance_sec,
         "sessions": [dict(r) for r in rows],
     }
+
+
+@app.get("/api/anomaly/ips")
+def anomaly_ips(
+    upload_id: int,
+    start_ts: Optional[float] = None,
+    end_ts: Optional[float] = None,
+    window_sec: float = Query(5.0, ge=0.1, description="统计窗口大小（秒），用于基线计算"),
+    sigma: float = Query(3.0, ge=1.0, le=10.0, description="异常阈值标准差倍数"),
+    direction: str = Query("both", description="uplink / downlink / both"),
+    top_k: int = Query(50, ge=1, le=500, description="返回最多多少个异常点"),
+    filters: Optional[str] = Query(None, description="JSON 字符串数组（在计算前过滤 packets）"),
+    db: sqlite3.Connection = Depends(get_db),
+):
+    """
+    统计学异常检测：
+    1. 按时间窗口（默认5s）统计每个IP的上下行总字节数
+    2. 计算每个IP的全局基线：均值(μ)和标准差(σ)
+    3. 某窗口字节数 > μ + sigma * σ 判定为异常
+    4. 返回异常点列表（含具体窗口时刻、IP、实际值、基线）
+    """
+    import math
+    filter_arr = parse_filters_from_query(filters)
+    extra_sql, extra_params = parse_filters(filter_arr, PACKET_ALLOWED_FIELDS)
+
+    c = db.cursor()
+
+    # Step 1: 确定时间基准
+    base_params: List[Any] = [upload_id]
+    base_where = "p.upload_id = ?"
+    if start_ts is not None:
+        base_where += " AND p.timestamp >= ?"
+        base_params.append(start_ts)
+    if end_ts is not None:
+        base_where += " AND p.timestamp <= ?"
+        base_params.append(end_ts)
+    base_params += extra_params
+    base_where += extra_sql
+
+    c.execute(f"SELECT MIN(p.timestamp) as mn, MAX(p.timestamp) as mx FROM packets p WHERE {base_where}", base_params)
+    r0 = c.fetchone()
+    if not r0 or r0["mn"] is None:
+        return {"baselines": [], "anomalies": [], "window_sec": window_sec, "sigma": sigma}
+
+    base_ts = r0["mn"]
+
+    # Step 2: 构建每个窗口每个 IP 的上行/下行字节统计
+    # 上行 (uplink) = 以该 IP 为 src_ip 发出的流量
+    # 下行 (downlink) = 以该 IP 为 dst_ip 接收的流量
+    directions_sql = []
+    union_params: List[Any] = []
+
+    if direction in ("uplink", "both"):
+        directions_sql.append(f"""
+            SELECT
+                CAST((p.timestamp - ?) / ? AS INTEGER) as bucket,
+                p.src_ip as ip,
+                'uplink' as direction,
+                SUM(p.length) as bytes
+            FROM packets p
+            WHERE {base_where} AND p.src_ip IS NOT NULL
+            GROUP BY bucket, p.src_ip
+        """)
+        union_params.extend([base_ts, window_sec] + base_params)
+    if direction in ("downlink", "both"):
+        directions_sql.append(f"""
+            SELECT
+                CAST((p.timestamp - ?) / ? AS INTEGER) as bucket,
+                p.dst_ip as ip,
+                'downlink' as direction,
+                SUM(p.length) as bytes
+            FROM packets p
+            WHERE {base_where} AND p.dst_ip IS NOT NULL
+            GROUP BY bucket, p.dst_ip
+        """)
+        union_params.extend([base_ts, window_sec] + base_params)
+
+    if not directions_sql:
+        return {"baselines": [], "anomalies": [], "window_sec": window_sec, "sigma": sigma}
+
+    union_sql = " UNION ALL ".join(directions_sql)
+
+    c.execute(f"""
+        CREATE TEMP TABLE IF NOT EXISTS _ip_stats AS
+        {union_sql}
+    """, union_params)
+
+    # Step 3: 按 (ip, direction) 计算统计量：样本数N、均值μ、方差σ²、标准差σ
+    c.execute("""
+        SELECT
+            ip,
+            direction,
+            COUNT(*) as n,
+            AVG(bytes) as mean,
+            CASE WHEN COUNT(*) > 1
+                 THEN MAX(0.0, (SUM(bytes * bytes) - COUNT(*) * AVG(bytes) * AVG(bytes)) / (COUNT(*) - 1))
+                 ELSE 0.0 END as var,
+            MIN(bytes) as min_b,
+            MAX(bytes) as max_b,
+            SUM(bytes) as total_b
+        FROM _ip_stats
+        GROUP BY ip, direction
+        HAVING COUNT(*) >= 3
+    """)
+    baselines_raw = c.fetchall()
+
+    baselines = []
+    ip_baseline_map: Dict[Tuple[str, str], Dict[str, Any]] = {}
+    for b in baselines_raw:
+        std = math.sqrt(b["var"]) if b["var"] and b["var"] > 0 else 0.0
+        entry = {
+            "ip": b["ip"],
+            "direction": b["direction"],
+            "n_windows": b["n"],
+            "mean": float(b["mean"] or 0),
+            "std": std,
+            "min": float(b["min_b"] or 0),
+            "max": float(b["max_b"] or 0),
+            "total": float(b["total_b"] or 0),
+            "threshold": float(b["mean"] or 0) + sigma * std,
+        }
+        baselines.append(entry)
+        ip_baseline_map[(entry["ip"], entry["direction"])] = entry
+
+    # Step 4: 找出所有超过阈值 μ + sigma * σ 的异常点
+    anomaly_results = []
+    if ip_baseline_map:
+        # 逐窗口计算，避免一次性加载
+        c.execute("SELECT * FROM _ip_stats")
+        for s in c.fetchall():
+            key = (s["ip"], s["direction"])
+            bl = ip_baseline_map.get(key)
+            if not bl:
+                continue
+            bytes_val = float(s["bytes"])
+            if bytes_val > bl["threshold"] and bl["std"] > 0:
+                z = (bytes_val - bl["mean"]) / bl["std"] if bl["std"] > 0 else 0
+                anomaly_results.append({
+                    "ip": s["ip"],
+                    "direction": s["direction"],
+                    "bucket_idx": int(s["bucket"]),
+                    "window_start": float(base_ts + s["bucket"] * window_sec),
+                    "window_mid": float(base_ts + (s["bucket"] + 0.5) * window_sec),
+                    "window_end": float(base_ts + (s["bucket"] + 1) * window_sec),
+                    "bytes": bytes_val,
+                    "mean": bl["mean"],
+                    "std": bl["std"],
+                    "threshold": bl["threshold"],
+                    "sigma_over": float(z),
+                    "ratio_vs_mean": round(bytes_val / bl["mean"], 2) if bl["mean"] > 0 else None,
+                })
+
+    anomaly_results.sort(key=lambda x: x["sigma_over"], reverse=True)
+    anomaly_results = anomaly_results[:top_k]
+
+    c.execute("DROP TABLE IF EXISTS _ip_stats")
+
+    baselines.sort(key=lambda x: x["total"], reverse=True)
+
+    return {
+        "window_sec": window_sec,
+        "sigma": sigma,
+        "time_range": {"start": r0["mn"], "end": r0["mx"], "base": base_ts},
+        "baselines": baselines[:1000],
+        "anomalies": anomaly_results,
+    }
+
+
+@app.get("/api/ip/sessions")
+def ip_sessions(
+    upload_id: int,
+    ip: str = Query(..., description="要查询的 IP 地址"),
+    start_ts: Optional[float] = None,
+    end_ts: Optional[float] = None,
+    direction: str = Query("both", description="as_src / as_dst / both"),
+    limit: int = Query(100, ge=1, le=1000),
+    offset: int = Query(0, ge=0),
+    filters: Optional[str] = Query(None, description="JSON 字符串数组"),
+    db: sqlite3.Connection = Depends(get_db),
+):
+    """查询指定 IP 参与的所有会话列表（含每个方向流量统计），用于异常点点击下钻。"""
+    filter_arr = parse_filters_from_query(filters)
+    extra_sql, extra_params = parse_filters(filter_arr, SESSION_ALLOWED_FIELDS)
+
+    c = db.cursor()
+    params: List[Any] = [upload_id]
+    where = "s.upload_id = ?"
+
+    if direction == "as_src":
+        where += " AND s.src_ip = ?"
+        params.append(ip)
+    elif direction == "as_dst":
+        where += " AND s.dst_ip = ?"
+        params.append(ip)
+    else:
+        where += " AND (s.src_ip = ? OR s.dst_ip = ?)"
+        params.extend([ip, ip])
+
+    if start_ts is not None:
+        where += " AND s.end_time >= ?"
+        params.append(start_ts)
+    if end_ts is not None:
+        where += " AND s.start_time <= ?"
+        params.append(end_ts)
+    params += extra_params
+    where += extra_sql
+
+    c.execute(f"""
+        SELECT s.*,
+            CASE WHEN s.src_ip = ? THEN s.total_bytes ELSE 0 END as sent_bytes,
+            CASE WHEN s.dst_ip = ? THEN s.total_bytes ELSE 0 END as recv_bytes
+        FROM sessions s
+        WHERE {where}
+        ORDER BY s.total_bytes DESC
+        LIMIT ? OFFSET ?
+    """, [ip, ip] + params + [limit, offset])
+    rows = c.fetchall()
+
+    cnt_sql = f"SELECT COUNT(*) as cnt FROM sessions s WHERE {where}"
+    c.execute(cnt_sql, params)
+    cnt_r = c.fetchone()
+
+    stat_sql = f"""
+        SELECT
+            COUNT(*) as sessions,
+            COALESCE(SUM(CASE WHEN s.src_ip = ? THEN s.total_bytes ELSE 0 END), 0) as total_sent,
+            COALESCE(SUM(CASE WHEN s.dst_ip = ? THEN s.total_bytes ELSE 0 END), 0) as total_recv,
+            COALESCE(SUM(s.packet_count), 0) as total_packets
+        FROM sessions s
+        WHERE {where}
+    """
+    c.execute(stat_sql, [ip, ip] + params)
+    stat_r = c.fetchone()
+
+    return {
+        "ip": ip,
+        "direction": direction,
+        "stats": {
+            "total_sessions": stat_r["sessions"] if stat_r else 0,
+            "total_sent": stat_r["total_sent"] if stat_r else 0,
+            "total_recv": stat_r["total_recv"] if stat_r else 0,
+            "total_bytes": (stat_r["total_sent"] or 0) + (stat_r["total_recv"] or 0),
+            "total_packets": stat_r["total_packets"] or 0,
+        },
+        "total": cnt_r["cnt"] if cnt_r else 0,
+        "sessions": [dict(r) for r in rows],
+    }
+
+
+@app.get("/api/filters/schema")
+def filters_schema():
+    """返回可用的过滤字段/操作符，供前端生成过滤面板。"""
+    from filters import ALLOWED_OPS
+    packet_fields = []
+    for name, cfg in PACKET_ALLOWED_FIELDS.items():
+        packet_fields.append({
+            "field": name,
+            "type": cfg["type"],
+            "sql_table": cfg.get("table", ""),
+            "special": cfg.get("special"),
+            "label": {
+                "timestamp": "时间戳 (s)",
+                "src_ip": "源 IP",
+                "dst_ip": "目的 IP",
+                "ip": "任一侧 IP",
+                "src_port": "源端口",
+                "dst_port": "目的端口",
+                "port": "任一侧端口",
+                "protocol": "协议",
+                "length": "包长度 (B)",
+                "payload_size": "载荷大小 (B)",
+                "tcp_flags": "TCP Flags",
+                "session_id": "会话 ID",
+                "start_time": "会话开始时间",
+                "end_time": "会话结束时间",
+                "duration": "会话持续时间",
+                "packet_count": "会话包数",
+                "total_bytes": "会话总字节",
+            }.get(name, name),
+        })
+    ops = [
+        {"op": "==", "label": "等于 (==", "types": ["number", "string"]},
+        {"op": "!=", "label": "不等于 (!=)", "types": ["number", "string"]},
+        {"op": ">", "label": "大于 (>)", "types": ["number"]},
+        {"op": ">=", "label": "大于等于 (>=)", "types": ["number"]},
+        {"op": "<", "label": "小于 (<)", "types": ["number"]},
+        {"op": "<=", "label": "小于等于 (<=)", "types": ["number"]},
+        {"op": "contains", "label": "包含 (LIKE %x%)", "types": ["string"]},
+        {"op": "not_contains", "label": "不包含", "types": ["string"]},
+        {"op": "startswith", "label": "开头是", "types": ["string"]},
+        {"op": "endswith", "label": "结尾是", "types": ["string"]},
+        {"op": "in", "label": "值之一 (逗号分隔)", "types": ["number", "string"]},
+        {"op": "not_in", "label": "不在其中 (逗号分隔)", "types": ["number", "string"]},
+        {"op": "has_flag", "label": "包含 TCP Flag", "types": ["string"]},
+        {"op": "regex", "label": "正则匹配 (REGEXP)", "types": ["string"]},
+    ]
+    return {"packet_fields": packet_fields, "ops": ops}
 
 
 @app.get("/api/health")

@@ -12,6 +12,9 @@ const API = {
   taskStatus: (id) => `/api/tasks/${id}/status`,
   taskCancel: (id) => `/api/tasks/${id}/cancel`,
   health: '/api/health',
+  anomalyIps: '/api/anomaly/ips',
+  ipSessions: '/api/ip/sessions',
+  filterSchema: '/api/filters/schema',
 };
 
 const state = {
@@ -27,6 +30,11 @@ const state = {
   pollingTaskId: null,
   pollingTimer: null,
   parserInfo: null,
+  sigma: 3.0,
+  anomalyData: null,
+  filters: [],
+  filterSchema: null,
+  filterCollapsed: false,
 };
 
 const PROTOCOL_COLORS = d3.scaleOrdinal(d3.schemeTableau10);
@@ -56,6 +64,32 @@ function getAbsoluteTsRange() {
   const start = state.minTs + (state.rangeStart / 100) * total;
   const end = state.minTs + (state.rangeEnd / 100) * total;
   return { start, end };
+}
+
+function encodeFilters(filters) {
+  if (!filters || filters.length === 0) return '';
+  try {
+    return '&filters=' + encodeURIComponent(JSON.stringify(filters));
+  } catch (e) {
+    return '';
+  }
+}
+
+function activeFiltersCount() {
+  return (state.filters || []).filter(f => f && f.field && f.op && (f.value !== undefined && f.value !== '' && f.value !== null)).length;
+}
+
+function updateFilterBadge() {
+  const n = activeFiltersCount();
+  const badge = $('filterActiveBadge');
+  if (badge) {
+    if (n > 0) {
+      badge.style.display = 'inline-block';
+      badge.textContent = `${n} 个条件`;
+    } else {
+      badge.style.display = 'none';
+    }
+  }
 }
 
 function updateRangeLabel() {
@@ -243,6 +277,9 @@ async function selectUpload(id, minTs, maxTs, pktCount) {
   $('rangeStart').value = 0;
   $('rangeEnd').value = 100;
 
+  $('filterPanel').hidden = false;
+  initFilterPanel();
+
   $('statPackets').textContent = formatNumber(pktCount);
   $('statDuration').textContent = formatDuration(state.maxTs - state.minTs);
 
@@ -253,18 +290,28 @@ async function selectUpload(id, minTs, maxTs, pktCount) {
 async function refreshAllCharts() {
   const { start, end } = getAbsoluteTsRange();
   setStatus('加载数据中...', 50);
+  const fs = encodeFilters(state.filters);
+  const anomalyWin = Math.max(state.windowSec * 5, 2.0);
 
   try {
-    const [trafficRes, protoRes, ipRes] = await Promise.all([
-      fetch(`${API.trafficWindow}?upload_id=${state.currentUploadId}&start_ts=${start}&end_ts=${end}&window_sec=${state.windowSec}`).then((r) => r.json()),
-      fetch(`${API.protoDist}?upload_id=${state.currentUploadId}&start_ts=${start}&end_ts=${end}`).then((r) => r.json()),
-      fetch(`${API.ipRanking}?upload_id=${state.currentUploadId}&start_ts=${start}&end_ts=${end}&top_n=15`).then((r) => r.json()),
-    ]);
+    const urls = [
+      `${API.trafficWindow}?upload_id=${state.currentUploadId}&start_ts=${start}&end_ts=${end}&window_sec=${state.windowSec}${fs}`,
+      `${API.protoDist}?upload_id=${state.currentUploadId}&start_ts=${start}&end_ts=${end}${fs}`,
+      `${API.ipRanking}?upload_id=${state.currentUploadId}&start_ts=${start}&end_ts=${end}&top_n=15${fs}`,
+      `${API.anomalyIps}?upload_id=${state.currentUploadId}&start_ts=${start}&end_ts=${end}&window_sec=${anomalyWin}&sigma=${state.sigma}${fs}`,
+    ];
+    const [trafficRes, protoRes, ipRes, anomalyRes] = await Promise.all(urls.map(u => fetch(u).then(r => r.json())));
 
     state.currentData = trafficRes;
-    drawStreamgraph(trafficRes);
+    state.anomalyData = anomalyRes;
+
+    drawStreamgraph(trafficRes, anomalyRes);
     drawProtoChart(protoRes);
     drawIpRanking(ipRes);
+
+    const cnt = (anomalyRes.anomalies || []).length;
+    $('anomalyCount').textContent = cnt;
+    $('anomalyBadge').style.display = cnt > 0 ? 'inline-block' : 'none';
 
     $('statProtos').textContent = protoRes.distribution.length;
     $('statBytes').textContent = formatBytes(protoRes.total_bytes);
@@ -298,7 +345,7 @@ function buildStackData(traffic) {
   return { layers: stack(data), data, keys };
 }
 
-function drawStreamgraph(traffic) {
+function drawStreamgraph(traffic, anomalyData = null) {
   const svg = d3.select('#streamgraph');
   svg.selectAll('*').remove();
 
@@ -477,6 +524,69 @@ function drawStreamgraph(traffic) {
       .attr('r', 4)
       .attr('fill', '#60a5fa');
   }).on('mouseleave', () => peakLine.selectAll('*').remove());
+
+  // ===== 异常点红点层 =====
+  if (anomalyData && anomalyData.anomalies && anomalyData.anomalies.length > 0) {
+    const anomG = g.append('g').attr('class', 'anomaly-layer');
+    const anoms = anomalyData.anomalies;
+    const maxSigma = d3.max(anoms, d => d.sigma_over) || 3;
+    const sizeScale = d3.scaleSqrt().domain([3, maxSigma]).range([5, 14]).clamp(true);
+
+    const tooltip = $('tooltip');
+
+    anomG.selectAll('.anomaly-dot')
+      .data(anoms)
+      .join('circle')
+      .attr('class', (_, i) => `anomaly-dot ${i % 3 === 0 ? 'pulse' : ''}`)
+      .attr('cx', d => {
+        const cx = x(d.window_mid);
+        return Math.max(4, Math.min(innerW - 4, cx));
+      })
+      .attr('cy', innerH / 2 + Math.sin(anoms.indexOf(d)) * 30)
+      .attr('r', d => sizeScale(d.sigma_over))
+      .attr('fill', d => {
+        if (d.direction === 'uplink') return '#f97316';
+        return '#ef4444';
+      })
+      .attr('stroke', '#fef2f2')
+      .attr('stroke-width', 1.5)
+      .attr('opacity', 0.9)
+      .on('mousemove', function (event, d) {
+        const relT = d.window_mid - state.minTs;
+        const html = `
+          <strong style="color:#fca5a5">🚨 IP 流量异常突增</strong><br/>
+          <span style="font-size:11px;color:#94a3b8">${d.direction === 'uplink' ? '上行' : '下行'} · ${d.sigma_over.toFixed(1)}σ 超阈值</span>
+          <hr style="border:none;border-top:1px solid #334155;margin:6px 0"/>
+          <strong style="font-family:monospace">${d.ip}</strong><br/>
+          ⏱ 窗口: ${relT.toFixed(2)}s ±${(anomalyData.window_sec / 2).toFixed(1)}s<br/>
+          📈 实际: <strong>${formatBytes(d.bytes)}</strong><br/>
+          基线 μ: ${formatBytes(Math.round(d.mean))}<br/>
+          阈值 μ+${anomalyData.sigma}σ: ${formatBytes(Math.round(d.threshold))}<br/>
+          超过均值: <strong style="color:#fbbf24">${d.ratio_vs_mean ? d.ratio_vs_mean.toFixed(1) + '×' : '-'}</strong>
+          <hr style="border:none;border-top:1px solid #334155;margin:6px 0"/>
+          <em style="font-size:11px;color:#94a3b8">💡 点击查看该IP的会话详情</em>
+        `;
+        tooltip.innerHTML = html;
+        tooltip.hidden = false;
+        const rect = svg.node().getBoundingClientRect();
+        const [_, by] = d3.pointer(event, svg.node());
+        let lx = event.clientX - rect.left + 15;
+        let ly = by - 10;
+        if (lx + tooltip.offsetWidth > rect.width) lx = event.clientX - rect.left - tooltip.offsetWidth - 15;
+        if (ly < 0) ly = by + 15;
+        tooltip.style.left = `${lx}px`;
+        tooltip.style.top = `${ly}px`;
+        d3.select(this).attr('opacity', 1).attr('stroke-width', 3);
+      })
+      .on('mouseleave', function () {
+        tooltip.hidden = true;
+        d3.select(this).attr('opacity', 0.9).attr('stroke-width', 1.5);
+      })
+      .on('click', function (event, d) {
+        event.stopPropagation();
+        openIpAnomalyDrill(d, anomalyData.sigma);
+      });
+  }
 }
 
 function drawProtoChart(proto) {
@@ -638,7 +748,8 @@ async function openDrill(timestamp) {
 async function loadDrillSessions() {
   const proto = $('drillProtoFilter').value;
   const tol = parseFloat($('drillTolerance').value) || 1;
-  const url = `${API.sessionsAt}?upload_id=${state.currentUploadId}&timestamp=${state.drillTs}&tolerance_sec=${tol}${proto ? `&protocol=${proto}` : ''}`;
+  const fs = encodeFilters(state.filters);
+  const url = `${API.sessionsAt}?upload_id=${state.currentUploadId}&timestamp=${state.drillTs}&tolerance_sec=${tol}${proto ? `&protocol=${proto}` : ''}${fs}`;
   const tbody = $('sessionTableBody');
   tbody.innerHTML = '<tr><td colspan="9" style="text-align:center;padding:20px;color:#94a3b8">加载中...</td></tr>';
   try {
@@ -739,6 +850,245 @@ function renderPackets(packets, sessionId) {
   }).join('');
 }
 
+// ============================================================
+//  过滤面板
+// ============================================================
+
+async function loadFilterSchema() {
+  if (state.filterSchema) return state.filterSchema;
+  try {
+    const res = await fetch(API.filterSchema);
+    if (!res.ok) return null;
+    state.filterSchema = await res.json();
+    return state.filterSchema;
+  } catch (e) {
+    console.warn('加载过滤schema失败', e);
+    return null;
+  }
+}
+
+async function initFilterPanel() {
+  updateFilterBadge();
+  if (state.filterSchema) {
+    renderFilterRows();
+    return;
+  }
+  const schema = await loadFilterSchema();
+  if (!schema) return;
+  renderFilterRows();
+}
+
+function renderFilterRows() {
+  const rowsContainer = $('filterRows');
+  const template = $('filterRowTemplate');
+  const schema = state.filterSchema;
+  if (!schema || !rowsContainer || !template) return;
+
+  if (state.filters.length === 0) {
+    // 空的，加一个默认行
+    state.filters.push({ field: 'protocol', op: '==', value: '' });
+  }
+
+  rowsContainer.innerHTML = '';
+  state.filters.forEach((filter, index) => {
+    const rowEl = template.content.firstElementChild.cloneNode(true);
+
+    const fieldSel = rowEl.querySelector('.f-field');
+    const opSel = rowEl.querySelector('.f-op');
+    const valueInput = rowEl.querySelector('.f-value');
+    const removeBtn = rowEl.querySelector('.f-remove');
+
+    schema.packet_fields.forEach(f => {
+      const opt = document.createElement('option');
+      opt.value = f.field;
+      opt.textContent = `${f.label} (${f.type})`;
+      opt.dataset.type = f.type;
+      fieldSel.appendChild(opt);
+    });
+
+    const refreshOps = () => {
+      const selectedField = fieldSel.value;
+      const fieldDef = schema.packet_fields.find(f => f.field === selectedField);
+      const fieldType = fieldDef?.type || 'string';
+      opSel.innerHTML = '';
+      schema.ops.forEach(op => {
+        if (!op.types.includes(fieldType)) return;
+        const opt = document.createElement('option');
+        opt.value = op.op;
+        opt.textContent = op.label;
+        opSel.appendChild(opt);
+      });
+      if (state.filters[index]) state.filters[index].field = selectedField;
+      if (!opSel.querySelector(`[value="${state.filters[index]?.op}"]`)) {
+        state.filters[index].op = opSel.value;
+      } else {
+        opSel.value = state.filters[index].op;
+      }
+    };
+
+    fieldSel.value = filter.field || 'protocol';
+    refreshOps();
+    opSel.value = filter.op || '==';
+    valueInput.value = filter.value || '';
+
+    fieldSel.addEventListener('change', refreshOps);
+    fieldSel.addEventListener('change', () => {
+      state.filters[index] = state.filters[index] || {};
+      state.filters[index].field = fieldSel.value;
+      state.filters[index].op = opSel.value;
+    });
+    opSel.addEventListener('change', () => {
+      state.filters[index] = state.filters[index] || {};
+      state.filters[index].op = opSel.value;
+    });
+    valueInput.addEventListener('input', () => {
+      state.filters[index] = state.filters[index] || {};
+      state.filters[index].value = valueInput.value;
+    });
+
+    removeBtn.addEventListener('click', () => {
+      state.filters.splice(index, 1);
+      renderFilterRows();
+      updateFilterBadge();
+    });
+
+    rowsContainer.appendChild(rowEl);
+  });
+  updateFilterBadge();
+}
+
+function addFilterRow() {
+  state.filters.push({ field: 'protocol', op: '==', value: '' });
+  renderFilterRows();
+  updateFilterBadge();
+}
+
+function clearFilters() {
+  state.filters = [];
+  renderFilterRows();
+  updateFilterBadge();
+}
+
+function applyFilters() {
+  // 只保留有效条件
+  state.filters = state.filters.filter(f =>
+    f && f.field && f.op && (f.value !== undefined && f.value !== '' && f.value !== null)
+  );
+  renderFilterRows();
+  updateFilterBadge();
+  if (state.currentUploadId) refreshAllCharts();
+}
+
+function toggleFilterPanel() {
+  state.filterCollapsed = !state.filterCollapsed;
+  const panel = $('filterPanel');
+  const btn = $('toggleFilterPanel');
+  if (state.filterCollapsed) {
+    panel.classList.add('collapsed');
+    if (btn) btn.textContent = '展开';
+  } else {
+    panel.classList.remove('collapsed');
+    if (btn) btn.textContent = '折叠';
+  }
+}
+
+// ============================================================
+//  IP 异常点下钻
+// ============================================================
+
+async function openIpAnomalyDrill(anomaly, sigma) {
+  const drill = $('ipAnomalyDrill');
+  drill.hidden = false;
+
+  $('anomIp').textContent = anomaly.ip;
+  $('anomDir').textContent = anomaly.direction === 'uplink' ? '⬆ 上行（该IP发出）' : '⬇ 下行（该IP接收）';
+  const summary = $('anomSummary');
+  summary.innerHTML = '';
+  const cards = [
+    { cls: 'danger', label: '异常窗口实际流量', value: formatBytes(anomaly.bytes), sub: `${anomaly.sigma_over.toFixed(1)}σ 超阈值` },
+    { cls: 'info', label: `基线均值 μ (N=${anomaly.n_windows || '-'})`, value: formatBytes(Math.round(anomaly.mean)), sub: `σ=${formatBytes(Math.round(anomaly.std || 0))}` },
+    { cls: 'warn', label: `触发阈值 μ+${sigma}σ`, value: formatBytes(Math.round(anomaly.threshold)), sub: `超过均值 ${anomaly.ratio_vs_mean ? anomaly.ratio_vs_mean.toFixed(1) + '×' : '-'}` },
+    { cls: 'success', label: '发生时刻', value: `${(anomaly.window_mid - state.minTs).toFixed(2)}s`, sub: `窗口 ${formatDuration(anomaly.window_end - anomaly.window_start)}` },
+  ];
+  cards.forEach(c => {
+    const d = document.createElement('div');
+    d.className = `anom-stats ${c.cls}`;
+    d.innerHTML = `
+      <div class="as-label">${c.label}</div>
+      <div class="as-value">${c.value}</div>
+      <div class="as-sub">${c.sub}</div>
+    `;
+    summary.appendChild(d);
+  });
+
+  // 获取该方向的会话
+  const fs = encodeFilters(state.filters);
+  const direction = anomaly.direction === 'uplink' ? 'as_src' : 'as_dst';
+  const url = `${API.ipSessions}?upload_id=${state.currentUploadId}&ip=${encodeURIComponent(anomaly.ip)}&direction=${direction}&start_ts=${anomaly.window_start}&end_ts=${anomaly.window_end}&limit=100${fs}`;
+
+  const tbody = $('ipSessionBody');
+  tbody.innerHTML = '<tr><td colspan="8" style="text-align:center;padding:20px;color:#94a3b8">加载会话中...</td></tr>';
+
+  try {
+    const res = await fetch(url);
+    const data = await res.json();
+    renderIpSessions(anomaly, data);
+  } catch (e) {
+    tbody.innerHTML = `<tr><td colspan="8" style="text-align:center;padding:20px;color:#ef4444">加载失败: ${e.message}</td></tr>`;
+  }
+
+  drill.scrollIntoView({ behavior: 'smooth', block: 'start' });
+}
+
+function renderIpSessions(anomaly, data) {
+  const tbody = $('ipSessionBody');
+  const sessions = data.sessions || [];
+  const ip = anomaly.ip;
+  if (sessions.length === 0) {
+    tbody.innerHTML = '<tr><td colspan="8" style="text-align:center;padding:20px;color:#94a3b8">在此时间窗口内未找到匹配会话（已被过滤器排除？）</td></tr>';
+    return;
+  }
+  tbody.innerHTML = sessions.map(s => {
+    const isSentByIp = s.src_ip === ip;
+    const peerIp = isSentByIp ? s.dst_ip : s.src_ip;
+    const peerPort = isSentByIp ? s.dst_port : s.src_port;
+    const dirCls = isSentByIp ? 'dir-up' : 'dir-down';
+    const dirSymbol = isSentByIp ? '⬆ 上行' : '⬇ 下行';
+    const sb = s.sent_bytes !== undefined ? s.sent_bytes : (s.src_ip === ip ? s.total_bytes : 0);
+    const rb = s.recv_bytes !== undefined ? s.recv_bytes : (s.dst_ip === ip ? s.total_bytes : 0);
+    return `
+      <tr>
+        <td><span class="${dirCls}">${dirSymbol}</span></td>
+        <td class="mono">${peerIp || '-'}</td>
+        <td class="mono">${peerPort ?? '-'}</td>
+        <td>${protoTag(s.protocol)}</td>
+        <td class="mono" style="color:#f59e0b">${formatBytes(sb || 0)}</td>
+        <td class="mono" style="color:#3b82f6">${formatBytes(rb || 0)}</td>
+        <td>${formatNumber(s.packet_count)}</td>
+        <td><button class="detail-btn" data-sid="${encodeURIComponent(s.id)}">详情</button></td>
+      </tr>
+    `;
+  }).join('');
+  tbody.querySelectorAll('.detail-btn').forEach(btn => {
+    btn.addEventListener('click', () => {
+      const sid = decodeURIComponent(btn.dataset.sid);
+      openSessionPackets(sid);
+      $('packetDetail').hidden = false;
+    });
+  });
+}
+
+// ============================================================
+//  Sigma 阈值切换
+// ============================================================
+
+function onSigmaChange() {
+  state.sigma = parseFloat($('sigmaSelect').value) || 3;
+  if (state.currentUploadId) refreshAllCharts();
+}
+
+// ============================================================
+
 function bindEvents() {
   $('fileInput').addEventListener('change', (e) => {
     const f = e.target.files?.[0];
@@ -796,7 +1146,7 @@ function bindEvents() {
   });
 
   window.addEventListener('resize', () => {
-    if (state.currentData) drawStreamgraph(state.currentData);
+    if (state.currentData) drawStreamgraph(state.currentData, state.anomalyData);
   });
 
   window.addEventListener('beforeunload', stopPolling);
@@ -807,6 +1157,20 @@ function bindEvents() {
     } else if (!document.hidden && state.pollingTaskId) {
       pollTaskStatus(state.pollingTaskId);
     }
+  });
+
+  // sigma 阈值
+  $('sigmaSelect').addEventListener('change', onSigmaChange);
+
+  // 过滤面板
+  $('addFilterBtn').addEventListener('click', addFilterRow);
+  $('clearFilterBtn').addEventListener('click', clearFilters);
+  $('applyFilterBtn').addEventListener('click', applyFilters);
+  $('toggleFilterPanel').addEventListener('click', toggleFilterPanel);
+
+  // IP 下钻关闭
+  $('closeIpDrill').addEventListener('click', () => {
+    $('ipAnomalyDrill').hidden = true;
   });
 }
 

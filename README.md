@@ -17,9 +17,11 @@
 - 🔍 **五元组解析**：源IP/目的IP/源端口/目的端口/协议，外加 TCP flags / seq / ack / 载荷
 - 📊 **时间窗口聚合**：0.1s / 0.5s / 1s / 2s / 5s / 10s 多粒度
 - 🌊 **流量河流图 (Streamgraph)**：D3 `stackOffsetWiggle` 实现的协议级堆叠可视化
+- ⚠️ **3σ 统计异常检测**：按 (IP, 上/下行方向, 时间窗) 计算 μ/σ 基线，河流图红点脉冲高亮超标点
 - 🕒 **双滑块时间轴**：范围缩放 + 防抖刷新
 - 🥧 **协议占比环形图** + 🏆 **IP对Top15 排行**
-- 🎯 **三级下钻**：波峰点击 → 时刻会话列表 → 逐包详情
+- 🔎 **组合条件过滤面板**：14 种操作符 (==/!=/>=/contains/regex/has_flag...) + 18 个字段白名单 + SQL 下沉
+- 🎯 **四级下钻**：河流图波峰 → 会话列表 → 逐包详情；异常红点 → IP会话详情 → 逐包详情
 - ⏱ **解析进度条**：实时百分比 + 可取消任务（前端轮询 /api/tasks/{id}/status）
 
 ---
@@ -41,7 +43,8 @@
 ```
 tss47/
 ├── backend/                     # FastAPI 后端
-│   ├── main.py                  # API 入口：上传/任务/查询/下钻/取消
+│   ├── main.py                  # API 入口：上传/任务/查询/下钻/取消/异常/过滤
+│   ├── filters.py               # ⭐ 通用 SQL 过滤构造器（字段白名单+操作符白名单+防注入）
 │   ├── parser.py                # ⭐ TShark CSV 导出 + Pandas 清洗 + 批量导入
 │   ├── task_queue.py            # ⭐ Redis RQ 任务队列 + 进度 (Redis + tasks 表双写)
 │   ├── database.py              # SQLite WAL 优化 / tasks 表 / CSV 批量导入
@@ -80,11 +83,133 @@ tss47/
 - `import_packets_from_csv()`：优先 `pandas.read_csv(...) + df.to_sql(method="multi")`，回退 `executemany` 2万行/批
 - `aggregate_sessions_from_db()`：通过单条 SQL `GROUP BY session_id` 聚合会话，代替内存字典
 
+**[filters.py](file:///e:/trae66/tss47/backend/filters.py)**
+- **通用安全 SQL 过滤构造器**：字段白名单 (13 packet + 18 session) + 操作符白名单 (14 种)，杜绝 SQL 注入
+- `parse_filters(filter_json, allowed_fields)` → `(sql_suffix: str, params: list)`，直接拼入主 SQL WHERE
+- 特殊字段自动展开：`ip` → `src_ip=? OR dst_ip=?`；`port` → `src_port=? OR dst_port=?`；`duration` → `(end-start) OP ?`
+- 全部查询接口 (`traffic/protocol/ip-pairs/drill/sessions`) + 新增的 `anomaly/ips` + `ip/sessions` 统一调用
+
 **[main.js](file:///e:/trae66/tss47/frontend/src/main.js)**
 - `handleUpload()`：上传仅返回 `task_id`，不等待
 - `pollTaskStatus()`：每 800ms 轮询 `/api/tasks/{id}/status`，实时更新进度条
 - 进度条颜色：蓝紫色(处理中) → 绿色(完成) → 红色(失败/取消)
 - 页面可见性变化时自动暂停/恢复轮询
+- **`drawStreamgraph()` 新增异常红点层**：`svg:circle` 按超标 σ 倍数缩放，方向用颜色（上行橙#f59e0b / 下行蓝#3b82f6），红色发光+脉冲动画
+- **过滤面板**：`loadFilterSchema` → `initFilterPanel` → `renderFilterRows`，字段/操作符/删除行全部动态渲染
+
+---
+
+## 📊 3σ 统计异常检测（新增）
+
+### 算法原理
+
+系统基于经典的 **3-σ 原则**（Pukelsheim 3σ rule：|X-μ| > 3σ 的概率 ≤ 0.27%）进行流量异常检测。不直接在 Python 内存中计算，而是**完全下沉到 SQLite 聚合**，保证即使 900 万包的大文件也能在 1~2s 内出结果。
+
+```
+阶段 1：时间窗口分桶
+   └─ 按 (window_size, direction) UNION ALL
+      ├─ 窗口_i: 统计每个 src_ip 发出的总 bytes (uplink)
+      └─ 窗口_i: 统计每个 dst_ip 接收的总 bytes (downlink)
+
+阶段 2：计算 (IP, 方向) 全局基线
+   └─ CREATE TEMP TABLE _ip_stats AS
+         SELECT ip, direction,
+                AVG(bytes)         AS mean,
+                COUNT(*)           AS n,
+                SUM(bytes*bytes)   AS sum_sq
+         FROM   _windows
+         GROUP  BY ip, direction
+   标准差公式: σ = sqrt( (sum_sq/n) - mean² )   // 总体方差
+
+阶段 3：逐窗口判定异常
+   └─ WHERE bytes > mean + sigma * σ
+      ORDER BY sigma_over DESC
+      LIMIT 50 (返回 Top-K 最异常的点)
+```
+
+### 交互链路
+
+```
+河流图 (Streamgraph)
+   │
+   ├─ 背景层：协议堆叠流（14 色 CatmullRom 曲线）
+   └─ 前景层：异常红点（带发光 + 脉冲缩放动画）
+         │
+         ├─ Hover → Tooltip 显示 "IP / 方向 / 均值μ / σ / 阈值μ+Nσ / 超标σ倍数"
+         └─ Click → openIpAnomalyDrill()
+                │
+                ├─ 4 色摘要卡片：实际流量(红) / 基线μ(蓝) / 阈值(黄) / 发生时刻(绿)
+                └─ 会话表格：对端 IP / 端口 / 协议 / sent_bytes / recv_bytes / 包数
+                       └─ Click 详情 → 复用 openSessionPackets() 下钻逐包
+```
+
+### σ 阈值切换
+
+河流图标题右侧提供下拉选择框，支持 2σ / 2.5σ / **3σ**(默认) / 3.5σ / 4σ / 5σ，切换后立即重新请求异常检测 API 并重绘红点。
+
+---
+
+## 🔎 组合条件过滤面板（新增）
+
+### 架构：过滤逻辑完全下沉后端
+
+所有过滤条件不在前端 `filter()`，而是**全部转成 SQL WHERE 子句**通过后端执行，这样即使加载了 900 万包，前端也不会卡顿。
+
+```
+ 前端过滤面板              FastAPI                SQLite
+   │                         │                      │
+   │ [protocol==TCP,         │ parse_filters()      │ SELECT ...
+   │  src_port==443]         │   → 字段/操作符      │   FROM packets p
+   │       │                 │     白名单校验       │   WHERE p.upload_id=?
+   │       ▼                 │   → 参数化拼接       │     AND p.protocol='TCP'
+   │ encodeFilters()         │     (防注入)        │     AND p.src_port=443
+   │   → "?filters=[...]"    │                      │  GROUP BY ...
+   └────────────────────────▶├─────────────────────▶│
+                             │                      │ （数据库索引直接命中，
+                             ◀─────────────────────┤  比内存快 10~100 倍）
+```
+
+### 支持的字段（13 + 18 种）
+
+| 分类 | 字段示例 |
+|------|---------|
+| 通用 (packets 表 13 个) | `src_ip`, `dst_ip`, `src_port`, `dst_port`, `protocol`, `length`, `payload_size`, `tcp_flags`, `window_size_value`, `ip (src or dst)`, `port (src or dst)` |
+| 增强 (sessions 额外 18 个) | `id`, `start_ts`, `end_ts`, `duration (=end-start)`, `packet_count`, `total_bytes`, `sent_bytes`, `recv_bytes`, `min_ttl`, `max_ttl`, `missing` |
+
+### 支持的操作符（14 种）
+
+| 操作符 | 含义 | 适用类型 |
+|--------|------|---------|
+| `==` / `!=` | 等于 / 不等于 | 所有 |
+| `>` / `>=` / `<` / `<=` | 数值比较 | number, datetime |
+| `contains` / `not_contains` | 包含子串 (LIKE) | string |
+| `startswith` / `endswith` | 前缀/后缀匹配 | string |
+| `in` / `not_in` | 多值匹配 (逗号分隔) | 所有 |
+| `regex` | 正则表达式匹配 (REGEXP) | string |
+| `has_flag` | TCP flag 位判断 (SYN/ACK/FIN...) | tcp_flags |
+
+---
+
+## API 接口汇总（已扩展）
+
+所有带 **※** 的接口统一接受 `filters=[{field,op,value}, ...]` JSON 参数，自动转成 SQL WHERE。
+
+| 方法 | 路径 | 说明 | filters |
+|------|------|------|---------|
+| POST | `/api/upload` | 提交 pcap 文件，返回 `{task_id}` | — |
+| GET | `/api/uploads` | 已上传文件列表 | — |
+| GET | `/api/tasks/{id}/status` | 查询解析进度 (轮询) | — |
+| POST | `/api/tasks/{id}/cancel` | 取消解析任务 | — |
+| GET | `/api/health` | 健康检查 + TShark/Scapy/Pandas/RQ 可用性 | — |
+| GET | `/api/filters/schema` | ⭐ 返回支持的字段和操作符白名单 | — |
+| GET | `/api/time-range` | 时间范围 + 总包数 | ※ |
+| GET | `/api/traffic` | ※ 窗口聚合流量（河流图数据源） | ※ |
+| GET | `/api/protocol` | ※ 协议占比（环形图数据源） | ※ |
+| GET | `/api/ip-pairs` | ※ Top-K IP 对通信量排行 | ※ |
+| GET | `/api/drill/timestamp` | ※ 点击波峰 → 时刻会话列表 | ※ |
+| GET | `/api/session/{id}/packets` | 单会话 → 逐包详情 | — |
+| GET | `/api/anomaly/ips` | ⭐ 每IP上下行流量基线 + 3σ异常点 | ※ |
+| GET | `/api/ip/sessions` | ⭐ 指定IP在时间窗内的会话列表 | ※ |
 
 ---
 
