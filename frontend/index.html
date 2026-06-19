@@ -1,0 +1,176 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>网络流量可视化分析器</title>
+  <link rel="stylesheet" href="/src/styles.css" />
+</head>
+<body>
+  <div id="app">
+    <header class="app-header">
+      <h1>🌊 网络流量可视化分析器</h1>
+      <div class="header-actions">
+        <label class="upload-btn">
+          <input type="file" id="fileInput" accept=".pcap,.pcapng" hidden />
+          <span>📁 上传 pcap / pcapng 文件</span>
+        </label>
+        <select id="uploadSelect" class="upload-select" title="选择已上传文件">
+          <option value="">-- 选择数据集 --</option>
+        </select>
+      </div>
+    </header>
+
+    <section id="uploadStatus" class="status-section" hidden>
+      <div class="status-card">
+        <span id="statusText">等待上传...</span>
+        <div id="progressBar" class="progress-bar"><div class="progress-fill"></div></div>
+      </div>
+    </section>
+
+    <main id="mainContent" class="main-content" hidden>
+      <div class="stats-bar">
+        <div class="stat-card">
+          <div class="stat-label">总数据包</div>
+          <div class="stat-value" id="statPackets">0</div>
+        </div>
+        <div class="stat-card">
+          <div class="stat-label">时间跨度</div>
+          <div class="stat-value" id="statDuration">0s</div>
+        </div>
+        <div class="stat-card">
+          <div class="stat-label">协议种类</div>
+          <div class="stat-value" id="statProtos">0</div>
+        </div>
+        <div class="stat-card">
+          <div class="stat-label">总字节</div>
+          <div class="stat-value" id="statBytes">0 B</div>
+        </div>
+      </div>
+
+      <div class="control-panel">
+        <div class="control-group">
+          <label>时间窗口：</label>
+          <select id="windowSelect">
+            <option value="0.1">0.1 秒</option>
+            <option value="0.5">0.5 秒</option>
+            <option value="1" selected>1 秒</option>
+            <option value="2">2 秒</option>
+            <option value="5">5 秒</option>
+            <option value="10">10 秒</option>
+          </select>
+        </div>
+        <div class="control-group">
+          <label>指标：</label>
+          <select id="metricSelect">
+            <option value="bytes" selected>字节数</option>
+            <option value="packets">包数量</option>
+          </select>
+        </div>
+        <div class="control-group range-group">
+          <label>选择时间范围：</label>
+          <div class="range-container">
+            <input type="range" id="rangeStart" min="0" max="100" value="0" step="0.1" />
+            <input type="range" id="rangeEnd" min="0" max="100" value="100" step="0.1" />
+            <div class="range-track"></div>
+          </div>
+          <span id="rangeLabel" class="range-label">0.00s ~ 0.00s</span>
+        </div>
+      </div>
+
+      <div class="viz-section">
+        <div class="chart-container">
+          <div class="chart-title">流量河流图 (Streamgraph)
+            <span class="chart-hint">💡 点击波峰可下钻查看该时刻的 TCP 会话</span>
+          </div>
+          <svg id="streamgraph" class="streamgraph-svg"></svg>
+          <div id="tooltip" class="d3-tooltip" hidden></div>
+        </div>
+      </div>
+
+      <div class="two-columns">
+        <div class="column-card">
+          <div class="chart-title">协议占比</div>
+          <svg id="protoChart" class="proto-svg"></svg>
+        </div>
+        <div class="column-card">
+          <div class="chart-title">IP 对通信量排行 (Top 15)</div>
+          <div class="rank-list" id="ipRankList"></div>
+        </div>
+      </div>
+
+      <div id="sessionDrill" class="drill-section" hidden>
+        <div class="drill-header">
+          <h3>🔍 下钻：<span id="drillTimeLabel"></span> 时刻活跃会话</h3>
+          <button id="closeDrill" class="close-btn">✕ 关闭</button>
+        </div>
+        <div class="drill-filter">
+          <label>协议过滤：
+            <select id="drillProtoFilter">
+              <option value="">全部</option>
+              <option value="TCP">TCP</option>
+              <option value="UDP">UDP</option>
+            </select>
+          </label>
+          <label>容差 ±
+            <input type="number" id="drillTolerance" value="1" min="0.1" step="0.1" />秒
+          </label>
+        </div>
+        <div class="session-table-wrap">
+          <table class="session-table">
+            <thead>
+              <tr>
+                <th>源 IP</th>
+                <th>源端口</th>
+                <th>目的 IP</th>
+                <th>目的端口</th>
+                <th>协议</th>
+                <th>包数</th>
+                <th>总字节</th>
+                <th>持续时间</th>
+                <th>操作</th>
+              </tr>
+            </thead>
+            <tbody id="sessionTableBody"></tbody>
+          </table>
+        </div>
+        <div id="packetDetail" class="packet-detail" hidden>
+          <div class="drill-header">
+            <h4>📦 会话包详情：<span id="sessionIdLabel"></span></h4>
+            <button id="closePacketDetail" class="close-btn">✕ 关闭</button>
+          </div>
+          <div class="packet-table-wrap">
+            <table class="session-table small">
+              <thead>
+                <tr>
+                  <th>#</th>
+                  <th>时间戳</th>
+                  <th>协议</th>
+                  <th>长度</th>
+                  <th>载荷</th>
+                  <th>TCP Flags</th>
+                </tr>
+              </thead>
+              <tbody id="packetTableBody"></tbody>
+            </table>
+          </div>
+        </div>
+      </div>
+    </main>
+
+    <div id="emptyState" class="empty-state">
+      <div class="empty-icon">📡</div>
+      <h2>开始分析网络流量</h2>
+      <p>请上传一个 <code>.pcap</code> 或 <code>.pcapng</code> 文件，或选择已上传的数据集。</p>
+      <ul class="feature-list">
+        <li>✅ 逐包解析：五元组提取 + TCP flags</li>
+        <li>✅ 流量河流图：按时间窗口的协议级堆叠可视化</li>
+        <li>✅ 交互下钻：点击波峰 → 查看 TCP 会话 → 查看包详情</li>
+        <li>✅ 协议占比 / IP对排行 辅助分析</li>
+      </ul>
+    </div>
+  </div>
+
+  <script type="module" src="/src/main.js"></script>
+</body>
+</html>
