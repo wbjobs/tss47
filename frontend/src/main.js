@@ -9,6 +9,9 @@ const API = {
   ipRanking: '/api/ip-pairs/ranking',
   sessionsAt: '/api/sessions/at-time',
   sessionPackets: '/api/sessions',
+  taskStatus: (id) => `/api/tasks/${id}/status`,
+  taskCancel: (id) => `/api/tasks/${id}/cancel`,
+  health: '/api/health',
 };
 
 const state = {
@@ -21,6 +24,9 @@ const state = {
   rangeEnd: 100,
   currentData: null,
   drillTs: null,
+  pollingTaskId: null,
+  pollingTimer: null,
+  parserInfo: null,
 };
 
 const PROTOCOL_COLORS = d3.scaleOrdinal(d3.schemeTableau10);
@@ -79,22 +85,116 @@ async function loadUploads() {
   }
 }
 
-function setStatus(text, progress = null) {
+function setStatus(text, progress = null, options = {}) {
   $('uploadStatus').hidden = false;
-  $('statusText').textContent = text;
+  const canCancel = options.cancelable;
+  const taskId = options.taskId;
+  let cancelHtml = '';
+  if (canCancel && taskId) {
+    cancelHtml = `<button id="cancelParseBtn" class="close-btn" style="margin-left:12px;background:#f59e0b">⏹ 取消解析</button>`;
+  }
+  $('statusText').innerHTML = text + cancelHtml;
   if (progress !== null) {
     $('progressBar .progress-fill').style.width = `${progress}%`;
+    $('progressBar .progress-fill').style.background =
+      progress >= 100 ? 'linear-gradient(90deg,#10b981,#34d399)'
+      : progress >= 0 ? 'linear-gradient(90deg,#3b82f6,#8b5cf6)'
+      : 'linear-gradient(90deg,#ef4444,#dc2626)';
+  }
+  const btn = $('cancelParseBtn');
+  if (btn && taskId) {
+    btn.addEventListener('click', () => cancelParseTask(taskId));
   }
 }
 
 function hideStatus() {
+  stopPolling();
   $('uploadStatus').hidden = true;
   $('progressBar .progress-fill').style.width = '0%';
 }
 
+function stopPolling() {
+  if (state.pollingTimer) {
+    clearTimeout(state.pollingTimer);
+    state.pollingTimer = null;
+  }
+  state.pollingTaskId = null;
+}
+
+async function cancelParseTask(taskId) {
+  try {
+    await fetch(API.taskCancel(taskId), { method: 'POST' });
+    stopPolling();
+    setStatus('⏹ 解析任务已取消', -1);
+    setTimeout(hideStatus, 2000);
+  } catch (e) {
+    console.error(e);
+  }
+}
+
+async function pollTaskStatus(taskId) {
+  state.pollingTaskId = taskId;
+  const POLL_INTERVAL = 800;
+  const MAX_POLL_TIME = 3600 * 1000;
+  const started = Date.now();
+
+  const loop = async () => {
+    if (state.pollingTaskId !== taskId) return;
+    if (Date.now() - started > MAX_POLL_TIME) {
+      setStatus('⏱ 解析超时', -1);
+      return;
+    }
+    try {
+      const res = await fetch(API.taskStatus(taskId));
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const s = await res.json();
+      const pct = Math.max(0, Math.min(100, s.progress || 0));
+      const msg = s.message || '处理中...';
+
+      if (s.status === 'completed' || pct >= 100) {
+        const result = s.result || {};
+        const pkt = result.packet_count ?? 0;
+        setStatus(`✅ 解析完成！共 ${formatNumber(pkt)} 个包。 ${msg}`, 100);
+        stopPolling();
+        loadUploads();
+        setTimeout(() => {
+          hideStatus();
+          selectUpload(
+            s.upload_id ?? result.upload_id,
+            result.min_timestamp,
+            result.max_timestamp,
+            pkt
+          );
+        }, 1000);
+        return;
+      }
+
+      if (s.status === 'failed') {
+        stopPolling();
+        const errMsg = s.error ? s.error.split('\n')[0] : (msg || '解析失败');
+        setStatus(`❌ 解析失败：${errMsg}`, -1);
+        return;
+      }
+
+      setStatus(`⏳ ${msg}`, pct, { cancelable: true, taskId });
+    } catch (e) {
+      console.warn('poll error:', e);
+    }
+    state.pollingTimer = setTimeout(loop, POLL_INTERVAL);
+  };
+  loop();
+}
+
 async function handleUpload(file) {
   if (!file) return;
-  setStatus(`正在上传并解析: ${file.name} ...`, 20);
+  stopPolling();
+
+  const fsize = file.size;
+  let sizeHint = '';
+  if (fsize > 50 * 1024 * 1024) {
+    sizeHint = `（${formatBytes(fsize)}，大文件将使用 tshark 流式解析）`;
+  }
+  setStatus(`📤 正在上传文件: ${file.name} ${sizeHint} ...`, 3);
 
   const fd = new FormData();
   fd.append('file', file);
@@ -106,14 +206,13 @@ async function handleUpload(file) {
       throw new Error(err.detail || '上传失败');
     }
     const data = await res.json();
-    setStatus(`✅ 解析完成！共 ${data.packet_count} 个包`, 100);
-    setTimeout(() => {
-      hideStatus();
-      selectUpload(data.upload_id, data.min_timestamp, data.max_timestamp, data.packet_count);
-    }, 800);
+    const taskId = data.task_id;
+    const note = data.note ? `（${data.note}）` : '';
+    setStatus(`📥 文件已接收，任务已提交${note}`, 5, { cancelable: true, taskId });
     loadUploads();
+    pollTaskStatus(taskId);
   } catch (e) {
-    setStatus(`❌ 错误: ${e.message}`, 0);
+    setStatus(`❌ 错误: ${e.message}`, -1);
   }
 }
 
@@ -699,9 +798,46 @@ function bindEvents() {
   window.addEventListener('resize', () => {
     if (state.currentData) drawStreamgraph(state.currentData);
   });
+
+  window.addEventListener('beforeunload', stopPolling);
+  document.addEventListener('visibilitychange', () => {
+    if (document.hidden && state.pollingTimer) {
+      clearTimeout(state.pollingTimer);
+      state.pollingTimer = null;
+    } else if (!document.hidden && state.pollingTaskId) {
+      pollTaskStatus(state.pollingTaskId);
+    }
+  });
+}
+
+async function showParserInfo() {
+  try {
+    const res = await fetch(API.health);
+    if (!res.ok) return;
+    const info = await res.json();
+    state.parserInfo = info;
+    const p = info.parsers || {};
+    const q = info.queue || {};
+    const badges = [];
+    badges.push(`<span style="padding:2px 8px;border-radius:4px;background:${p.tshark?.available ? '#10b98133;color:#34d399' : '#ef444433;color:#f87171'};font-size:11px">tshark ${p.tshark?.available ? '✓' : '✗'}</span>`);
+    badges.push(`<span style="padding:2px 8px;border-radius:4px;background:${p.scapy?.available ? '#10b98133;color:#34d399' : '#ef444433;color:#f87171'};font-size:11px">scapy ${p.scapy?.available ? '✓' : '✗'}</span>`);
+    badges.push(`<span style="padding:2px 8px;border-radius:4px;background:${p.pandas?.available ? '#10b98133;color:#34d399' : '#f59e0b33;color:#fbbf24'};font-size:11px">pandas ${p.pandas?.available ? '✓' : '✗'}</span>`);
+    badges.push(`<span style="padding:2px 8px;border-radius:4px;background:${q.rq_available ? '#10b98133;color:#34d399' : '#f59e0b33;color:#fbbf24'};font-size:11px">RQ队列 ${q.rq_available ? '✓' : '回退线程'}</span>`);
+    const header = document.querySelector('.app-header h1');
+    if (header) {
+      const wrap = document.createElement('div');
+      wrap.style.cssText = 'display:flex;gap:6px;align-items:center;margin-top:6px';
+      wrap.innerHTML = badges.join('');
+      header.parentNode.style.flexDirection = 'column';
+      header.parentNode.style.alignItems = 'flex-start';
+      header.parentNode.insertBefore(wrap, header.nextSibling);
+    }
+  } catch (e) {
+    // ignore
+  }
 }
 
 document.addEventListener('DOMContentLoaded', async () => {
   bindEvents();
-  await loadUploads();
+  await Promise.all([loadUploads(), showParserInfo()]);
 });

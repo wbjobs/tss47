@@ -2,6 +2,7 @@ import os
 import time
 import uuid
 import asyncio
+import threading
 from typing import Optional, List, Dict, Any
 from fastapi import FastAPI, UploadFile, File, HTTPException, Depends, Query
 from fastapi.middleware.cors import CORSMiddleware
@@ -10,9 +11,20 @@ import sqlite3
 
 from database import init_db, get_db, DB_PATH
 from parser import parse_pcap_file
+from task_queue import (
+    enqueue_parse_task,
+    get_task_progress,
+    mark_task_failed,
+    mark_task_completed,
+    update_task_progress,
+    RQ_AVAILABLE,
+    get_queue,
+)
 
 UPLOAD_DIR = os.path.join(os.path.dirname(__file__), "uploads")
 os.makedirs(UPLOAD_DIR, exist_ok=True)
+
+_sync_parse_threads: Dict[str, threading.Thread] = {}
 
 app = FastAPI(title="Traffic Analyzer API")
 
@@ -30,13 +42,23 @@ def startup():
     init_db()
 
 
-class UploadResponse(BaseModel):
+class UploadAcceptedResponse(BaseModel):
     upload_id: int
+    task_id: str
     filename: str
+    mode: str
+    note: str = ""
+
+
+class TaskStatusResponse(BaseModel):
+    task_id: str
     status: str
-    packet_count: int
-    min_timestamp: float
-    max_timestamp: float
+    progress: float
+    message: str
+    upload_id: Optional[int] = None
+    result: Optional[Dict[str, Any]] = None
+    error: Optional[str] = None
+    updated_at: Optional[float] = None
 
 
 class UploadInfo(BaseModel):
@@ -45,9 +67,44 @@ class UploadInfo(BaseModel):
     uploaded_at: float
     packet_count: int
     status: str
+    min_timestamp: Optional[float] = None
+    max_timestamp: Optional[float] = None
 
 
-@app.post("/api/upload", response_model=UploadResponse)
+def _run_sync_parse_task(file_path: str, upload_id: int,
+                         filename: str, task_id: str):
+    """在单独线程中执行解析（RQ 不可用时的回退方案），并写入进度。"""
+    from parser import _parse_with_tshark, _parse_with_scapy
+    try:
+        def cb(pct: float, msg: str):
+            try:
+                update_task_progress(task_id, pct, msg, {"filename": filename})
+            except Exception:
+                pass
+
+        ok, cnt, mn, mx = _parse_with_tshark(file_path, upload_id, cb)
+        if not ok:
+            ok, cnt, mn, mx = _parse_with_scapy(file_path, upload_id, cb)
+        if not ok:
+            raise RuntimeError("tshark 和 scapy 均解析失败")
+
+        result = {
+            "upload_id": upload_id,
+            "filename": filename,
+            "packet_count": cnt,
+            "min_timestamp": mn,
+            "max_timestamp": mx,
+        }
+        mark_task_completed(task_id, f"✅ 解析完成，共 {cnt} 个包", result)
+    except Exception as e:
+        import traceback
+        tb = traceback.format_exc()
+        mark_task_failed(task_id, f"{e}\n{tb}")
+    finally:
+        _sync_parse_threads.pop(task_id, None)
+
+
+@app.post("/api/upload", response_model=UploadAcceptedResponse)
 async def upload_pcap(file: UploadFile = File(...), db: sqlite3.Connection = Depends(get_db)):
     if not file.filename or not (file.filename.endswith(".pcap") or file.filename.endswith(".pcapng")):
         raise HTTPException(status_code=400, detail="Only .pcap or .pcapng files are allowed")
@@ -56,9 +113,15 @@ async def upload_pcap(file: UploadFile = File(...), db: sqlite3.Connection = Dep
     safe_name = f"{uuid.uuid4().hex}{ext}"
     file_path = os.path.join(UPLOAD_DIR, safe_name)
 
-    contents = await file.read()
+    size = 0
+    chunk_size = 1024 * 1024 * 8
     with open(file_path, "wb") as f:
-        f.write(contents)
+        while True:
+            chunk = await file.read(chunk_size)
+            if not chunk:
+                break
+            f.write(chunk)
+            size += len(chunk)
 
     uploaded_at = time.time()
     c = db.cursor()
@@ -69,30 +132,174 @@ async def upload_pcap(file: UploadFile = File(...), db: sqlite3.Connection = Dep
     upload_id = c.lastrowid
     db.commit()
 
-    loop = asyncio.get_event_loop()
-    try:
-        packet_count, min_ts, max_ts = await loop.run_in_executor(
-            None, parse_pcap_file, file_path, upload_id
-        )
-    except Exception as e:
-        c.execute("UPDATE uploads SET status='failed' WHERE id=?", (upload_id,))
-        db.commit()
-        raise HTTPException(status_code=500, detail=f"Parse error: {str(e)}")
+    enq = enqueue_parse_task(file_path, upload_id, file.filename)
+    task_id = enq["task_id"]
+    mode = enq["mode"]
+    note = enq.get("note", "")
 
-    return UploadResponse(
+    c.execute("UPDATE uploads SET task_id=? WHERE id=?", (task_id, upload_id))
+    db.commit()
+
+    with get_db() as _conn:
+        pass
+    try:
+        with sqlite3.connect(DB_PATH, timeout=60) as conn:
+            cc = conn.cursor()
+            cc.execute("""
+                INSERT INTO tasks (id, upload_id, status, progress, message, created_at, updated_at)
+                VALUES (?, ?, 'pending', 0, '任务已入队', ?, ?)
+                ON CONFLICT(id) DO UPDATE SET
+                    upload_id=excluded.upload_id,
+                    status='pending',
+                    progress=0,
+                    message='任务已入队',
+                    updated_at=excluded.updated_at
+            """, (task_id, upload_id, time.time(), time.time()))
+            conn.commit()
+    except Exception:
+        pass
+
+    if mode == "sync_fallback":
+        t = threading.Thread(
+            target=_run_sync_parse_task,
+            args=(file_path, upload_id, file.filename, task_id),
+            daemon=True,
+        )
+        t.start()
+        _sync_parse_threads[task_id] = t
+        note = "Redis 未连接，已回退到内置线程池异步解析。如需更高并发性能，请启动 Redis 与 RQ Worker。"
+
+    return UploadAcceptedResponse(
         upload_id=upload_id,
+        task_id=task_id,
         filename=file.filename,
-        status="completed",
-        packet_count=packet_count,
-        min_timestamp=min_ts,
-        max_timestamp=max_ts,
+        mode=mode,
+        note=note,
     )
+
+
+@app.get("/api/tasks/{task_id}/status", response_model=TaskStatusResponse)
+def get_task_status(task_id: str, db: sqlite3.Connection = Depends(get_db)):
+    progress = get_task_progress(task_id)
+    status = "pending"
+    pct = 0.0
+    message = ""
+    upload_id = None
+    result = None
+    error = None
+    updated_at = None
+
+    if progress:
+        status = progress.get("status") or progress.get("task_state") or "running"
+        if progress.get("progress") is not None:
+            pct = float(progress["progress"])
+        message = progress.get("message") or ""
+        error = progress.get("error")
+        extra = progress.get("extra") or {}
+        if pct >= 100 and not error and extra and "packet_count" in extra:
+            status = "completed"
+            result = extra
+        if error:
+            status = "failed"
+        updated_at = progress.get("updated_at")
+        if extra and "upload_id" in extra:
+            upload_id = extra["upload_id"]
+
+    if status in ("pending", "running") and RQ_AVAILABLE:
+        try:
+            from rq.job import Job
+            from task_queue import get_redis_conn
+            r = get_redis_conn()
+            job = Job.fetch(task_id, connection=r)
+            status_map = {
+                "queued": "pending",
+                "started": "running",
+                "deferred": "pending",
+                "scheduled": "pending",
+                "finished": "completed",
+                "failed": "failed",
+                "canceled": "failed",
+                "stopped": "failed",
+            }
+            rq_status = job.get_status()
+            if status in ("pending", "running"):
+                new_s = status_map.get(rq_status, status)
+                if status != "completed" or new_s != status:
+                    status = new_s
+            if rq_status == "finished" and result is None and job.result:
+                result = job.result
+                status = "completed"
+            if rq_status == "failed" and not error:
+                try:
+                    exc = job.exc_info
+                    if exc:
+                        error = exc.splitlines()[-1] if isinstance(exc, str) else str(exc)
+                        status = "failed"
+                except Exception:
+                    pass
+            if upload_id is None and result and "upload_id" in result:
+                upload_id = result["upload_id"]
+        except Exception:
+            pass
+
+    return TaskStatusResponse(
+        task_id=task_id,
+        status=status,
+        progress=min(100.0, max(0.0, pct)),
+        message=message,
+        upload_id=upload_id,
+        result=result,
+        error=error,
+        updated_at=updated_at,
+    )
+
+
+@app.post("/api/tasks/{task_id}/cancel")
+def cancel_task(task_id: str, db: sqlite3.Connection = Depends(get_db)):
+    canceled = False
+    message = ""
+    if task_id in _sync_parse_threads:
+        t = _sync_parse_threads.get(task_id)
+        if t and t.is_alive():
+            message = "线程池任务取消请求已记录（将在下一检查点终止）"
+            canceled = True
+    if RQ_AVAILABLE:
+        try:
+            from rq.job import Job
+            from rq.command import send_stop_job_command
+            from task_queue import get_redis_conn
+            r = get_redis_conn()
+            job = Job.fetch(task_id, connection=r)
+            job.cancel()
+            try:
+                send_stop_job_command(r, task_id)
+            except Exception:
+                pass
+            canceled = True
+            message = "RQ 任务已取消"
+        except Exception as e:
+            if not canceled:
+                raise HTTPException(status_code=404, detail=f"任务不存在或无法取消: {e}")
+    try:
+        c = db.cursor()
+        c.execute("""
+            INSERT INTO tasks (id, status, message, updated_at)
+            VALUES (?, 'failed', ?, ?)
+            ON CONFLICT(id) DO UPDATE SET status='failed', message=excluded.message, updated_at=excluded.updated_at
+        """, (task_id, message or "任务已取消", time.time()))
+        db.commit()
+    except Exception:
+        pass
+    return {"task_id": task_id, "canceled": canceled, "message": message or "任务取消请求已提交"}
 
 
 @app.get("/api/uploads", response_model=List[UploadInfo])
 def list_uploads(db: sqlite3.Connection = Depends(get_db)):
     c = db.cursor()
-    c.execute("SELECT id, filename, uploaded_at, packet_count, status FROM uploads ORDER BY id DESC")
+    c.execute("""
+        SELECT id, filename, uploaded_at, packet_count, status, min_timestamp, max_timestamp
+        FROM uploads ORDER BY id DESC
+    """)
     rows = c.fetchall()
     return [
         UploadInfo(
@@ -101,6 +308,8 @@ def list_uploads(db: sqlite3.Connection = Depends(get_db)):
             uploaded_at=r["uploaded_at"],
             packet_count=r["packet_count"],
             status=r["status"],
+            min_timestamp=r["min_timestamp"],
+            max_timestamp=r["max_timestamp"],
         )
         for r in rows
     ]
@@ -109,7 +318,10 @@ def list_uploads(db: sqlite3.Connection = Depends(get_db)):
 @app.get("/api/uploads/{upload_id}", response_model=UploadInfo)
 def get_upload(upload_id: int, db: sqlite3.Connection = Depends(get_db)):
     c = db.cursor()
-    c.execute("SELECT id, filename, uploaded_at, packet_count, status FROM uploads WHERE id=?", (upload_id,))
+    c.execute("""
+        SELECT id, filename, uploaded_at, packet_count, status, min_timestamp, max_timestamp
+        FROM uploads WHERE id=?
+    """, (upload_id,))
     r = c.fetchone()
     if not r:
         raise HTTPException(status_code=404, detail="Upload not found")
@@ -119,6 +331,8 @@ def get_upload(upload_id: int, db: sqlite3.Connection = Depends(get_db)):
         uploaded_at=r["uploaded_at"],
         packet_count=r["packet_count"],
         status=r["status"],
+        min_timestamp=r["min_timestamp"],
+        max_timestamp=r["max_timestamp"],
     )
 
 
@@ -392,4 +606,31 @@ def sessions_at_time(
 
 @app.get("/api/health")
 def health():
-    return {"status": "ok", "db_exists": os.path.exists(DB_PATH)}
+    from parser import find_tshark, tshark_version_ok, SCAPY_AVAILABLE, PANDAS_AVAILABLE
+    info = {
+        "status": "ok",
+        "db_exists": os.path.exists(DB_PATH),
+        "parsers": {},
+        "queue": {},
+    }
+    tshark_path = find_tshark()
+    info["parsers"]["tshark"] = {
+        "available": bool(tshark_path and tshark_version_ok(tshark_path)),
+        "path": tshark_path,
+    }
+    info["parsers"]["scapy"] = {"available": SCAPY_AVAILABLE}
+    info["parsers"]["pandas"] = {"available": PANDAS_AVAILABLE}
+    try:
+        q = get_queue()
+        info["queue"]["rq_available"] = q is not None
+        if q is not None:
+            info["queue"]["queued_jobs"] = q.count
+            try:
+                from task_queue import get_redis_conn
+                r = get_redis_conn()
+                info["queue"]["redis_connected"] = bool(r.ping())
+            except Exception:
+                info["queue"]["redis_connected"] = False
+    except Exception as e:
+        info["queue"] = {"rq_available": False, "error": str(e)}
+    return info
